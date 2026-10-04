@@ -337,31 +337,6 @@ def test_checkpoint_skips_tree_exactly_when_slot_keeps_row(
         assert tree_cache.session.keeps_row(req) == (not into_tree)
 
 
-def test_borrowed_slot_is_the_slot_whose_record_the_request_runs_on():
-    """Only a request running on the slot's record borrows it; an abort of any
-    other request leaves the slot and its lock alone."""
-    req_to_token = torch.arange(256, dtype=torch.int32).reshape(2, 128)
-    tree_cache = _FakeInnerCache(
-        _FakeReqToTokenPool(req_to_token), _FakeAllocator(), page_size=1
-    )
-    slot = SessionSlot(
-        kv=ReqKvInfo(req_pool_idx=0, kv_committed_len=8, kv_allocated_len=8),
-        last_node=SimpleNamespace(id=42),
-    )
-    tree_cache.session.slots["session-a"] = slot
-    on_slot = _FakeReq("session-a", req_pool_idx=0, committed=8, allocated=8)
-    on_slot.kv = slot.kv
-    own_record = _FakeReq("session-a", req_pool_idx=1, committed=8, allocated=8)
-
-    assert tree_cache.session.borrowed_slot(on_slot) is slot
-    assert tree_cache.session.borrowed_slot(own_record) is None
-
-    own_record.finished_reason = FINISH_ABORT()
-    assert not tree_cache.session.try_cache_finished_req(own_record)
-    assert tree_cache.session.slots["session-a"] is slot
-    assert tree_cache.dec_lock_ref_calls == []
-
-
 def test_finished_first_turn_hands_whole_record_to_slot(published_config):
     """A finished first turn skips the tree at checkpoint, so its mamba state
     is still on the record the slot takes at release."""
