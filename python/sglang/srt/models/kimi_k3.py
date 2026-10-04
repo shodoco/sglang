@@ -47,7 +47,12 @@ from sglang.srt.layers.dp_attention import (
     is_allocation_symmetric,
     is_dp_attention_enabled,
 )
-from sglang.srt.layers.layer_boundary import append_stages, declare_attn, declare_ffn
+from sglang.srt.layers.layer_boundary import (
+    ExitRows,
+    append_stages,
+    declare_attn,
+    declare_ffn,
+)
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layer_boundary.residual.add_norm import (
     REPLACE_AT_EXIT,
@@ -2453,13 +2458,23 @@ def _fuses_attn_all_reduce(config: KimiLinearConfig) -> bool:
 
 def _uses_stage_boundaries(config: KimiLinearConfig) -> bool:
     """Whether the layers build stage boundaries, which is the same for every
-    layer of a stack. A dense MLP sharded over attention TP, an MoE on its
-    attention-TP token shard (SP-MoE) and an attention-residual bank whose
-    o_proj all-reduce is fused with the pending add still run the layer's own
-    communication."""
+    layer of a stack. These still run the layer's own communication: a dense
+    MLP sharded over attention TP; an attention-residual bank whose o_proj
+    all-reduce is fused with the pending add, or whose MoE on its attention-TP
+    token shard (SP-MoE) uses K3's tuned SP collectives or the sharded carry;
+    and SP-MoE on batches that are not padded to a multiple of attention TP
+    (--disable-attn-tp-gather)."""
     if get_parallel().enable_dense_mlp_attn_tp and is_dp_attention_enabled():
         return False
-    return not (_shards_moe_rows() or _fuses_attn_all_reduce(config))
+    if _fuses_attn_all_reduce(config):
+        return False
+    if not _shards_moe_rows():
+        return True
+    if not require_mlp_sync():
+        return False
+    return config.attn_res_block_size is None or not (
+        k3_sp_collective.enabled() or envs.SGLANG_K3_SP_ATTN_RES.get()
+    )
 
 
 class KimiK3DecoderLayer(nn.Module):
@@ -2649,6 +2664,14 @@ class KimiK3DecoderLayer(nn.Module):
                         **ffn_ops,
                         sparse=self._is_moe_layer,
                         next_layer_sparse=_is_moe_layer(config, layer_idx + 1),
+                        # SP-MoE runs on this rank's attention-TP shard of the
+                        # rows; on the bank path, whose reads write the bank on
+                        # every row, its output returns to all of them.
+                        exit_rows=(
+                            ExitRows.ATTENTION
+                            if self._sp_moe and self.use_attn_residuals
+                            else None
+                        ),
                         # A latent MoE completes its output sum together with
                         # the latent reduction its norm needs.
                         output_complete=self._is_moe_layer and self.mlp.use_latent_moe,
