@@ -176,6 +176,10 @@ def checkpoint_kv_cache(req: Req, tree_cache: BasePrefixCache) -> None:
         return
 
     if req.finished():
+        if tree_cache.will_claim_kv_row(req):
+            # The row outlives the request (a streaming session keeps it), and
+            # release_kv_cache hands it over whole.
+            return
         # The fill-id array lags output_ids until the next prepare_for_decode.
         req.refresh_fill_ids()
         up_to = req.owned_kv_len()

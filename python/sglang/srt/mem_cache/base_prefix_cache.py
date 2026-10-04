@@ -516,6 +516,12 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         if req.last_node is not None:
             self.dec_lock_ref(req.last_node)
 
+    def will_claim_kv_row(self, req: Req) -> bool:
+        """Whether ``claim_kv_row`` takes this request's kv row when the request
+        lets go of it. A finished request the cache will claim is not
+        checkpointed into the tree: its KV goes to the claimer instead."""
+        return False
+
     def claim_kv_row(self, req: Req) -> bool:
         """A streaming session keeps the request's kv row for the next turn.
         Return True after taking the row; the caller then releases nothing."""

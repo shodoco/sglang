@@ -981,6 +981,9 @@ class UnifiedRadixCache(BasePrefixCache):
             return DecLockRefResult()
         return self.tree_core.dec_host_lock_ref(node_id, params)
 
+    def will_claim_kv_row(self, req: Req) -> bool:
+        return self.session.keeps_row(req)
+
     def claim_kv_row(self, req: Req) -> bool:
         # Retraction also enters here: retain its ticket until actual finish.
         if (

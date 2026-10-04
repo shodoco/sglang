@@ -3,7 +3,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from sglang.srt.managers.schedule_batch import FINISH_ABORT, ReqKvInfo
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, FINISH_LENGTH, ReqKvInfo
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
@@ -11,7 +11,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     IncLockRefResult,
     MatchResult,
 )
-from sglang.srt.mem_cache.common import release_kv_cache
+from sglang.srt.mem_cache.common import checkpoint_kv_cache, release_kv_cache
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
@@ -78,10 +78,16 @@ class _FakeInnerCache:
         self.dec_lock_ref_calls = []
         self.dec_lock_ref_params = []
         self.dec_lock_ref_skip_swa = []
+        self.tree_checkpoints = []
         self.session = StreamingSession(self)
 
     def checkpoint(self, req, *, up_to):
-        pass
+        if self.session.try_checkpoint(req, up_to=up_to):
+            return
+        self.tree_checkpoints.append(up_to)
+
+    def will_claim_kv_row(self, req):
+        return self.session.keeps_row(req)
 
     def claim_kv_row(self, req):
         return self.session.try_cache_finished_req(req)
@@ -140,6 +146,7 @@ class _FakeReq:
         self.to_finish = None
         self.finished_reason = None
         self.finished_len = None
+        self.extend_range = SimpleNamespace(end=committed)
 
     skip_radix_cache_insert = False
 
@@ -294,6 +301,88 @@ def test_nth_mid_abort_drops_session_slot(published_config):
     # Pool slot returned.
     assert req_to_token_pool.free_slots == [0]
     assert req.kv.req_pool_idx is None
+
+
+@pytest.mark.parametrize(
+    "has_slot, finished_reason, into_tree",
+    [
+        # Running: a first turn publishes its prompt; a later turn runs on
+        # the slot's KV.
+        (False, None, True),
+        (True, None, False),
+        # Finished: the slot takes the row at release, so the tree gets nothing.
+        (False, FINISH_LENGTH(length=0), False),
+        (True, FINISH_LENGTH(length=0), False),
+        # Aborted: the slot lets go, so the turn checkpoints like any request.
+        (False, FINISH_ABORT(), True),
+        (True, FINISH_ABORT(), True),
+    ],
+)
+def test_checkpoint_skips_tree_exactly_when_slot_keeps_row(
+    has_slot, finished_reason, into_tree
+):
+    req_to_token = torch.arange(128, dtype=torch.int32).reshape(1, 128)
+    tree_cache = _FakeInnerCache(
+        _FakeReqToTokenPool(req_to_token), _FakeAllocator(), page_size=1
+    )
+    req = _FakeReq("session-a", req_pool_idx=0, committed=20, allocated=20)
+    req.finished_reason = finished_reason
+    if has_slot:
+        tree_cache.session.slots["session-a"] = SessionSlot(kv=req.kv)
+
+    checkpoint_kv_cache(req, tree_cache)
+
+    assert tree_cache.tree_checkpoints == ([20] if into_tree else [])
+    if req.finished():
+        assert tree_cache.session.keeps_row(req) == (not into_tree)
+
+
+def test_borrowed_slot_is_the_slot_whose_record_the_request_runs_on():
+    """Only a request running on the slot's record borrows it; an abort of any
+    other request leaves the slot and its lock alone."""
+    req_to_token = torch.arange(256, dtype=torch.int32).reshape(2, 128)
+    tree_cache = _FakeInnerCache(
+        _FakeReqToTokenPool(req_to_token), _FakeAllocator(), page_size=1
+    )
+    slot = SessionSlot(
+        kv=ReqKvInfo(req_pool_idx=0, kv_committed_len=8, kv_allocated_len=8),
+        last_node=SimpleNamespace(id=42),
+    )
+    tree_cache.session.slots["session-a"] = slot
+    on_slot = _FakeReq("session-a", req_pool_idx=0, committed=8, allocated=8)
+    on_slot.kv = slot.kv
+    own_record = _FakeReq("session-a", req_pool_idx=1, committed=8, allocated=8)
+
+    assert tree_cache.session.borrowed_slot(on_slot) is slot
+    assert tree_cache.session.borrowed_slot(own_record) is None
+
+    own_record.finished_reason = FINISH_ABORT()
+    assert not tree_cache.session.try_cache_finished_req(own_record)
+    assert tree_cache.session.slots["session-a"] is slot
+    assert tree_cache.dec_lock_ref_calls == []
+
+
+def test_finished_first_turn_hands_whole_record_to_slot(published_config):
+    """A finished first turn skips the tree at checkpoint, so its mamba state
+    is still on the record the slot takes at release."""
+    req_to_token = torch.arange(128, dtype=torch.int32).reshape(1, 128)
+    req_to_token_pool = _FakeReqToTokenPool(req_to_token)
+    allocator = _FakeAllocator()
+    tree_cache = _FakeInnerCache(req_to_token_pool, allocator, page_size=1)
+    req = _FakeReq("session-a", req_pool_idx=0, committed=20, allocated=20)
+    mamba_pool_idx = torch.tensor([3])
+    req.kv.mamba_pool_idx = mamba_pool_idx
+    req.finished_reason = FINISH_LENGTH(length=0)
+
+    checkpoint_kv_cache(req, tree_cache)
+    release_kv_cache(req, tree_cache)
+
+    slot = tree_cache.session.slots["session-a"]
+    assert slot.kv.mamba_pool_idx is mamba_pool_idx
+    assert slot.kv.req_pool_idx == 0
+    assert tree_cache.tree_checkpoints == []
+    assert allocator.freed == []
+    assert req_to_token_pool.free_slots == []
 
 
 @pytest.mark.parametrize("uuid", [None, 17])

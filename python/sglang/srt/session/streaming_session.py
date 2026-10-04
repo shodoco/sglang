@@ -181,6 +181,21 @@ class StreamingSession:
             cache_protected_len=slot.kv.cache_protected_len,
         )
 
+    def borrowed_slot(self, req: Req) -> Optional[SessionSlot]:
+        """The slot whose KV record the request runs on now: a later turn
+        borrows it in ``restore_to_req``; a first turn owns its record."""
+        if not _is_streaming(req):
+            return None
+        slot = self.slots.get(req.session.session_id)
+        return slot if slot is not None and slot.kv is req.kv else None
+
+    def keeps_row(self, req: Req) -> bool:
+        """Whether the slot takes the request's row when it lets go: a
+        streaming turn that finishes or is retracted, but not an abort."""
+        from sglang.srt.managers.schedule_batch import FINISH_ABORT
+
+        return _is_streaming(req) and not isinstance(req.finished_reason, FINISH_ABORT)
+
     def try_cache_finished_req(self, req: Req) -> bool:
         """Hands a turn's row to the session slot when it finishes or is
         retracted. Returns False for non-streaming requests and aborts, which
@@ -188,16 +203,13 @@ class StreamingSession:
         if not _is_streaming(req):
             return False
 
-        from sglang.srt.managers.schedule_batch import FINISH_ABORT
-
         session_id = req.session.session_id
-        slot = self.slots.get(session_id)
-        if isinstance(req.finished_reason, FINISH_ABORT):
+        if not self.keeps_row(req):
+            slot = self.borrowed_slot(req)
             if slot is not None:
                 # The turn ran on the slot's record, which the caller releases
                 # (row and mamba state): drop the slot with its tree lock. The
                 # session keeps its last finished request and re-prefills next turn.
-                assert slot.kv is req.kv
                 del self.slots[session_id]
                 if slot.last_node is not None:
                     skip = {"skip_swa": True} if slot.swa_prefix_lock_released else {}
@@ -205,6 +217,7 @@ class StreamingSession:
             req.session.abort_req()
             return False
 
+        slot = self.slots.get(session_id)
         is_first = slot is None
         if is_first:
             slot = SessionSlot()
@@ -229,8 +242,10 @@ class StreamingSession:
     def try_checkpoint(self, req: Req, *, up_to: int, **kwargs) -> bool:
         """A first turn checkpoints into the tree like any request (its
         prompt prefix is tree-owned and the slot inherits that lock); later
-        turns run on the slot's KV, so only the chunk cursor is kept."""
-        if not _is_streaming(req) or req.session.session_id not in self.slots:
+        turns run on the slot's KV, so only the chunk cursor is kept. A
+        finished turn reaching here is one the slot does not keep (an abort),
+        and checkpoints like any request."""
+        if req.finished() or self.borrowed_slot(req) is None:
             return False
         kv_indices = self.cache.req_to_token_pool.req_to_token[
             req.kv.req_pool_idx, :up_to
